@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 type Result<T> = std::result::Result<T, String>;
 
 pub struct BytePacketBuffer {
@@ -76,17 +78,60 @@ impl BytePacketBuffer {
         Ok(res)
     }
 
+    fn write(&mut self, val: u8) -> Result<()> {
+        if self.pos >= 512 {
+            return Err("End of buffer".into());
+        }
+        self.buf[self.pos] = val;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn write_u8(&mut self, val: u8) -> Result<()> {
+        self.write(val)?;
+
+        Ok(())
+    }
+
+    fn write_u16(&mut self, val: u16) -> Result<()> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write(((val >> 24) & 0xFF) as u8)?;
+        self.write(((val >> 16) & 0xFF) as u8)?;
+        self.write(((val >> 8) & 0xFF) as u8)?;
+        self.write(((val >> 0) & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<()> {
+        for label in qname.split('.') {
+            let len = label.len();
+            if len > 0x3f {
+                return Err("Single label exceeds 63 characters of length".into());
+            }
+
+            self.write_u8(len as u8)?;
+            for b in label.as_bytes() {
+                self.write_u8(*b)?;
+            }
+        }
+
+        self.write_u8(0)?;
+
+        Ok(())
+    }
     /// Read a qname
     ///
     /// The tricky part: Reading domain names, taking labels into consideration.
     /// Will take something like [3]www[6]google[3]com[0] and append
     /// www.google.com to outstr.
     fn read_qname(&mut self, outstr: &mut String) -> Result<()> {
-        // Since we might encounter jumps, we'll keep track of our position
-        // locally as opposed to using the position within the struct. This
-        // allows us to move the shared position to a point past our current
-        // qname, while keeping track of our progress on the current qname
-        // using this variable.
         let mut pos = self.pos();
 
         // track whether or not we've jumped
@@ -260,188 +305,324 @@ impl DnsHeader {
         Ok(())
     }
 
-    /// Serialize the DNS header into the first 12 bytes of a DNS message.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(12);
-        bytes.extend_from_slice(&self.id.to_be_bytes());
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_u16(self.id)?;
 
-        // Build the 16-bit flags field byte-by-byte using the same bit layout
-        // that `read()` decodes.
-        let mut a: u8 = 0; // high byte of flags
-        let mut b: u8 = 0; // low byte of flags
+        buffer.write_u8(
+            (self.recursion_desired as u8)
+                | ((self.truncated_message as u8) << 1)
+                | ((self.authoritative_answer as u8) << 2)
+                | (self.opcode << 3)
+                | ((self.response as u8) << 7) as u8,
+        )?;
 
-        if self.recursion_desired {
-            a |= 1 << 0;
-        }
-        if self.truncated_message {
-            a |= 1 << 1;
-        }
-        if self.authoritative_answer {
-            a |= 1 << 2;
-        }
-        a |= (self.opcode as u8 & 0x0F) << 3;
-        if self.response {
-            a |= 1 << 7;
-        }
+        buffer.write_u8(
+            (self.rescode as u8)
+                | ((self.checking_disabled as u8) << 4)
+                | ((self.authed_data as u8) << 5)
+                | ((self.z as u8) << 6)
+                | ((self.recursion_available as u8) << 7),
+        )?;
 
-        b |= self.rescode as u8 & 0x0F;
-        if self.checking_disabled {
-            b |= 1 << 4;
-        }
-        if self.authed_data {
-            b |= 1 << 5;
-        }
-        if self.z {
-            b |= 1 << 6;
-        }
-        if self.recursion_available {
-            b |= 1 << 7;
-        }
+        buffer.write_u16(self.questions)?;
+        buffer.write_u16(self.answers)?;
+        buffer.write_u16(self.authoritative_entries)?;
+        buffer.write_u16(self.resource_entries)?;
 
-        let flags = u16::from_be_bytes([a, b]);
-        bytes.extend_from_slice(&flags.to_be_bytes());
+        Ok(())
+    }
+}
 
-        bytes.extend_from_slice(&self.questions.to_be_bytes());
-        bytes.extend_from_slice(&self.answers.to_be_bytes());
-        bytes.extend_from_slice(&self.authoritative_entries.to_be_bytes());
-        bytes.extend_from_slice(&self.resource_entries.to_be_bytes());
-        bytes
+#[derive(Debug, Clone)]
+pub enum QueryType {
+    UNKNOWN(u16),
+    A, // 1
+}
+
+impl QueryType {
+    pub fn to_num(&self) -> u16 {
+        match *self {
+            QueryType::UNKNOWN(x) => x,
+            QueryType::A => 1,
+        }
     }
 
-    /// Parse a DNS header from the first 12 bytes of a DNS message.
-    /// Returns `(header, offset_after_header)`.
-    pub fn from_bytes(buf: &[u8]) -> Option<(DnsHeader, usize)> {
-        if buf.len() < 12 {
-            return None;
+    pub fn from_num(num: u16) -> QueryType {
+        match num {
+            1 => QueryType::A,
+            x => QueryType::UNKNOWN(x),
         }
-        let mut packet = BytePacketBuffer::new();
-        let len = buf.len().min(512);
-        packet.buf[..len].copy_from_slice(&buf[..len]);
-        packet.pos = 0;
-
-        let mut header = DnsHeader::new();
-        header.read(&mut packet).ok()?;
-        Some((header, 12))
     }
 }
 
 // Dns Name + qtype (2bytes)+ qclass(2 bytes)
+#[derive(Debug, Clone)]
 pub struct DnsQuestion {
     pub name: String,
-    pub qtype: u16,
-    pub qclass: u16,
+    pub qtype: QueryType,
 }
 
 impl DnsQuestion {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        // for google.com we need to store as -> \x06google\x03com\x00)
-
-        for part in self.name.split(".") {
-            bytes.push(part.len() as u8);
-            bytes.extend_from_slice(part.as_bytes());
-        }
-        bytes.push(0); // terminating the domain name with null byte 
-        bytes.extend_from_slice(&self.qtype.to_be_bytes());
-        bytes.extend_from_slice(&self.qclass.to_be_bytes());
-        bytes
+    pub fn new(name: String, qtype: QueryType) -> DnsQuestion {
+        DnsQuestion { name, qtype }
     }
 
-    /// Skip over a question in a DNS response buffer.
-    /// Returns the new offset after the question, or None on error.
-    pub fn skip_in_response(buf: &[u8], mut offset: usize) -> Option<usize> {
-        offset = skip_name(buf, offset)?;
+    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.read_qname(&mut self.name)?;
+        self.qtype = QueryType::from_num(buffer.read_u16()?);
+        let _ = buffer.read_u16()?; // class 
+        Ok(())
+    }
 
-        // Skip QTYPE (2 bytes) and QCLASS (2 bytes)
-        if offset + 4 > buf.len() {
-            return None;
-        }
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_qname(&self.name)?;
 
-        Some(offset + 4)
+        let typenum = self.qtype.to_num();
+        buffer.write_u16(typenum)?;
+        buffer.write_u16(1)?;
+
+        Ok(())
     }
 }
 
-fn skip_name(buf: &[u8], mut offset: usize) -> Option<usize> {
-    loop {
-        if offset >= buf.len() {
-            return None;
-        }
-        let len = buf[offset];
+// when the server sends response , it echoes your exact Header and Question back to you , but is also
+// fills the Answer ,Authority ,Additional Sections  with Resource Records (RR) often known as DNS Record
 
-        // Compression pointer (two bytes)
-        if len & 0b1100_0000 == 0b1100_0000 {
-            if offset + 1 >= buf.len() {
-                return None;
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum DnsRecord {
+    UNKNOWN {
+        domain: String,
+        qtype: u16,
+        data_len: u16,
+        ttl: u32,
+    }, // 0
+    A {
+        domain: String,
+        addr: Ipv4Addr,
+        ttl: u32,
+    }, // 1
+}
+
+impl DnsRecord {
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsRecord> {
+        let mut domain = String::new();
+        buffer.read_qname(&mut domain)?;
+
+        let qtype_num = buffer.read_u16()?;
+        let qtype = QueryType::from_num(qtype_num);
+        let _ = buffer.read_u16()?;
+        let ttl = buffer.read_u32()?;
+        let data_len = buffer.read_u16()?;
+
+        match qtype {
+            QueryType::A => {
+                let raw_addr = buffer.read_u32()?;
+                let addr = Ipv4Addr::new(
+                    ((raw_addr >> 24) & 0xFF) as u8,
+                    ((raw_addr >> 16) & 0xFF) as u8,
+                    ((raw_addr >> 8) & 0xFF) as u8,
+                    ((raw_addr >> 0) & 0xFF) as u8,
+                );
+                Ok(DnsRecord::A { domain, addr, ttl })
             }
-            return Some(offset + 2);
+
+            QueryType::UNKNOWN(_) => {
+                let _ = buffer.step(data_len as usize);
+
+                Ok(DnsRecord::UNKNOWN {
+                    domain,
+                    qtype: qtype_num,
+                    data_len,
+                    ttl,
+                })
+            }
+        }
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        let start_pos = buffer.pos();
+
+        match *self {
+            DnsRecord::A {
+                ref domain,
+                ref addr,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::A.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(4)?;
+
+                let octets = addr.octets();
+                buffer.write_u8(octets[0])?;
+                buffer.write_u8(octets[1])?;
+                buffer.write_u8(octets[2])?;
+                buffer.write_u8(octets[3])?;
+            }
+            DnsRecord::UNKNOWN { .. } => {
+                println!("Skipping record: {:?}", self);
+            }
         }
 
-        // End of name
-        if len == 0 {
-            return Some(offset + 1);
-        }
-
-        // Normal label
-        let label_len = len as usize;
-        offset += 1;
-        if offset + label_len > buf.len() {
-            return None;
-        }
-        offset += label_len;
+        Ok(buffer.pos() - start_pos)
     }
 }
 
-/// Parse all IPv4 addresses from A records (answer + authority + additional).
-///
-/// This intentionally ignores record owner names to keep learning simple.
-pub fn parse_ipv4_addrs(buf: &[u8]) -> Option<(DnsHeader, Vec<std::net::Ipv4Addr>)> {
-    let (header, mut offset) = DnsHeader::from_bytes(buf)?;
+#[derive(Debug, Clone)]
+pub struct DnsPacket {
+    pub header: DnsHeader,
+    pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsRecord>,
+    pub authorities: Vec<DnsRecord>,
+    pub resources: Vec<DnsRecord>,
+}
 
-    // Skip questions
-    for _ in 0..header.questions {
-        offset = DnsQuestion::skip_in_response(buf, offset)?;
+impl DnsPacket {
+    pub fn new() -> DnsPacket {
+        DnsPacket {
+            header: DnsHeader::new(),
+            questions: Vec::new(),
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            resources: Vec::new(),
+        }
     }
 
-    let total_rrs = header.answers as usize
-        + header.authoritative_entries as usize
-        + header.resource_entries as usize;
+    pub fn from_buffer(buffer: &mut BytePacketBuffer) -> Result<DnsPacket> {
+        let mut result = DnsPacket::new();
+        result.header.read(buffer)?;
 
-    let mut addrs = Vec::new();
-
-    for _ in 0..total_rrs {
-        offset = skip_name(buf, offset)?;
-
-        if offset + 10 > buf.len() {
-            return None;
+        for _ in 0..result.header.questions {
+            let mut question = DnsQuestion::new("".to_string(), QueryType::UNKNOWN(0));
+            question.read(buffer)?;
+            result.questions.push(question);
+        }
+        for _ in 0..result.header.answers {
+            let rec = DnsRecord::read(buffer)?;
+            result.answers.push(rec);
         }
 
-        let rtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-        let _class = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
-        let _ttl = u32::from_be_bytes([
-            buf[offset + 4],
-            buf[offset + 5],
-            buf[offset + 6],
-            buf[offset + 7],
-        ]);
-        let rdlength = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
-        offset += 10;
-
-        if offset + rdlength > buf.len() {
-            return None;
+        for _ in 0..result.header.authoritative_entries {
+            let rec = DnsRecord::read(buffer)?;
+            result.authorities.push(rec);
         }
 
-        if rtype == 1 && rdlength == 4 {
-            let addr = std::net::Ipv4Addr::new(
-                buf[offset],
-                buf[offset + 1],
-                buf[offset + 2],
-                buf[offset + 3],
-            );
-            addrs.push(addr);
+        for _ in 0..result.header.resource_entries {
+            let rec = DnsRecord::read(buffer)?;
+            result.resources.push(rec);
         }
 
-        offset += rdlength;
+        Ok(result)
     }
 
-    Some((header, addrs))
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.header.questions = self.questions.len() as u16;
+        self.header.answers = self.answers.len() as u16;
+        self.header.authoritative_entries = self.authorities.len() as u16;
+        self.header.resource_entries = self.resources.len() as u16;
+
+        self.header.write(buffer)?;
+
+        for question in &self.questions {
+            question.write(buffer)?;
+        }
+        for rec in &self.answers {
+            rec.write(buffer)?;
+        }
+        for rec in &self.authorities {
+            rec.write(buffer)?;
+        }
+        for rec in &self.resources {
+            rec.write(buffer)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn qname_write_google_com() {
+        let mut buf = BytePacketBuffer::new();
+        buf.write_qname("google.com").unwrap();
+        let written = &buf.buf[..buf.pos];
+
+        let expected = [
+            6u8, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+
+        assert_eq!(written, expected);
+    }
+
+    #[test]
+    fn qname_read_google_com() {
+        let mut buf = BytePacketBuffer::new();
+        let qname = [
+            6u8, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        buf.buf[..qname.len()].copy_from_slice(&qname);
+        buf.pos = 0;
+
+        let mut out = String::new();
+        buf.read_qname(&mut out).unwrap();
+
+        assert_eq!(out, "google.com");
+    }
+
+    #[test]
+    fn qname_read_with_compression_pointer() {
+        // Layout:
+        // [0..12)  => "google.com"
+        // [12..14) => pointer to offset 0 => 0xC0 0x00
+        let full = [
+            6u8, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        let pointer = [0xC0u8, 0x00u8];
+
+        let mut buf = BytePacketBuffer::new();
+        buf.buf[..full.len()].copy_from_slice(&full);
+        buf.buf[full.len()..full.len() + 2].copy_from_slice(&pointer);
+
+        buf.pos = full.len();
+
+        let mut out = String::new();
+        buf.read_qname(&mut out).unwrap();
+
+        assert_eq!(out, "google.com");
+    }
+
+    #[test]
+    fn dns_question_write_and_read_a() {
+        let mut buf = BytePacketBuffer::new();
+        let q = DnsQuestion::new("google.com".to_string(), QueryType::A);
+        q.write(&mut buf).unwrap();
+
+        buf.pos = 0;
+        let mut q2 = DnsQuestion::new("".to_string(), QueryType::UNKNOWN(0));
+        q2.read(&mut buf).unwrap();
+
+        assert_eq!(q2.name, "google.com");
+        assert!(matches!(q2.qtype, QueryType::A));
+    }
+
+    #[test]
+    fn dns_record_read_a() {
+        let rec = DnsRecord::A {
+            domain: "google.com".to_string(),
+            addr: Ipv4Addr::new(1, 2, 3, 4),
+            ttl: 60,
+        };
+
+        let mut buf = BytePacketBuffer::new();
+        rec.write(&mut buf).unwrap();
+
+        buf.pos = 0;
+        let rec2 = DnsRecord::read(&mut buf).unwrap();
+        assert_eq!(rec2, rec);
+    }
 }

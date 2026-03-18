@@ -1,16 +1,8 @@
-use std::{
-    env::args,
-    net::{SocketAddrV4, UdpSocket},
-};
+use std::{env::args, net::UdpSocket};
 
-use crate::model::{DnsHeader, DnsQuestion, ResultCode, parse_ipv4_addrs};
+use crate::model::{BytePacketBuffer, DnsPacket, DnsQuestion, DnsRecord, QueryType};
 
 mod model;
-
-pub struct Cache {
-    #[allow(dead_code)]
-    map: std::collections::HashMap<String, SocketAddrV4>,
-}
 
 pub const ROOT_SERVERS: &[&str] = &[
     "198.41.0.4",
@@ -30,82 +22,102 @@ pub const ROOT_SERVERS: &[&str] = &[
 
 #[tokio::main]
 async fn main() {
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let argv: Vec<String> = args().collect();
 
-    // taking domain name input from user
-    let args: Vec<String> = args().collect();
-
-    if args.len() < 2 {
-        eprintln!("Usage: {} <domain>", args[0]);
+    if argv.len() < 2 {
+        eprintln!("Usage: {} <domain>", argv[0]);
         return;
     }
-    if args.len() > 2 {
+    if argv.len() > 2 {
         eprintln!("Error: expected exactly one domain argument");
         return;
     }
 
-    let query = &args[1];
+    let domain = argv[1].clone();
 
-    let header = DnsHeader {
-        id: 1234,
-        recursion_desired: false,
-        truncated_message: false,
-        authoritative_answer: false,
-        opcode: 0,
-        response: false,
-        rescode: ResultCode::NOERROR,
-        checking_disabled: false,
-        authed_data: false,
-        z: false,
-        recursion_available: false,
-        questions: 1,
-        answers: 0,
-        authoritative_entries: 0,
-        resource_entries: 0,
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to bind UDP socket: {e}");
+            return;
+        }
     };
 
-    let question = DnsQuestion {
-        name: query.to_string(),
-        qtype: 1, // Type 1 = A Record (IPv4)
-        qclass: 1,
+    // Build request packet: QNAME=domain, QTYPE=A.
+    let mut request = DnsPacket::new();
+    request.header.id = 1234;
+    request
+        .questions
+        .push(DnsQuestion::new(domain.clone(), QueryType::A));
+
+    // Serialize request into bytes.
+    let mut out_buf = BytePacketBuffer::new();
+    if let Err(e) = request.write(&mut out_buf) {
+        eprintln!("Failed to build DNS query packet: {e}");
+        return;
+    }
+    let size = out_buf.pos;
+
+    // Send to root server.
+    if let Err(e) = socket.send_to(&out_buf.buf[..size], (ROOT_SERVERS[0], 53)) {
+        eprintln!("Failed to send DNS query: {e}");
+        return;
+    }
+
+    // Receive response bytes.
+    let mut raw = [0u8; 512];
+    let (bytes_received, server_addr) = match socket.recv_from(&mut raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to receive DNS response: {e}");
+            return;
+        }
+    };
+    println!("\nReceived {} bytes from {}.", bytes_received, server_addr);
+
+    // Parse response into a DnsPacket.
+    let mut in_buf = BytePacketBuffer::new();
+    in_buf.buf[..bytes_received].copy_from_slice(&raw[..bytes_received]);
+    in_buf.pos = 0;
+
+    let response = match DnsPacket::from_buffer(&mut in_buf) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to parse DNS response: {e}");
+            return;
+        }
     };
 
-    let mut dns_packet = Vec::new();
-    dns_packet.extend(header.to_bytes());
-    dns_packet.extend(question.to_bytes());
+    println!(
+        "Header: id={}, response={}, questions={}, answers={}, authorities={}, resources={}",
+        response.header.id,
+        response.header.response,
+        response.header.questions,
+        response.header.answers,
+        response.header.authoritative_entries,
+        response.header.resource_entries
+    );
 
-    socket.send_to(&dns_packet, (ROOT_SERVERS[0], 53)).unwrap();
-
-    let mut buffer = [0u8; 512];
-    let (bytes_recieved, server_addr) = socket.recv_from(&mut buffer).unwrap();
-
-    println!("\nReceived {} bytes from {}.", bytes_recieved, server_addr);
-
-    // Try to parse the response into a readable form.
-    match parse_ipv4_addrs(&buffer[..bytes_recieved]) {
-        Some((resp_header, addrs)) => {
-            println!(
-                "Header: id={}, response={}, questions={}, answers={}, authorities={}, additionals={}",
-                resp_header.id,
-                resp_header.response,
-                resp_header.questions,
-                resp_header.answers,
-                resp_header.authoritative_entries,
-                resp_header.resource_entries,
-            );
-
-            if addrs.is_empty() {
-                println!("No IPv4 (A) records found in the response.");
-            } else {
-                println!("IPv4 addresses found:");
-                for ip in addrs {
-                    println!("  {}", ip);
-                }
-            }
+    // Print IPv4 addresses (A records) from all sections we parsed.
+    let mut any_a = false;
+    for rec in response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .chain(response.resources.iter())
+    {
+        if let DnsRecord::A {
+            domain,
+            addr,
+            ttl: _,
+        } = rec
+        {
+            any_a = true;
+            println!("  {} -> {}", domain, addr);
         }
-        None => {
-            println!("Failed to parse DNS response, raw bytes:");
-            println!("{:?}", &buffer[..bytes_recieved]);
-        }
+    }
+
+    if !any_a {
+        println!("No IPv4 (A) records found in the response.");
     }
 }
