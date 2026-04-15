@@ -1,7 +1,8 @@
-- we will stat by running a server on port 8080 (can be any)
-- we will take user query for asking domain name 
-- implementing udp protocol , and creating recursive dns ,
-- pass query to the root server using dns_protocol 
-- and from their it will go to top-level domain servers (.com , .in , .tech etc) ,
-- from their it will go to authoritative name servers (ns1.vercel-01.com) - it stores the answer , 
-- the answer will be first cached and then give to the user following ip 
+
+1. Configurable DNS server via CLI args
+2. Randomize query ID for security
+3. Add caching with TTL expiry
+4. Add error handling with retries
+5. Support multiple record types (AAAA, MX, CNAME)
+6. Use the deserialize method properly
+7. Add TCP fallback
