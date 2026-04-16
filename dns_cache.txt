@@ -1,0 +1,6 @@
+google.com 24:4:68:0:40:2:8:9:0:0:0:0:0:0:20:e AAAA
+google.com 10 smtp.google.com MX
+google.com 172.217.24.238 A
+google.com 10 smtp.google.com MX
+google.com 10 smtp.google.com MX
+google.com 10 smtp.google.com MX
